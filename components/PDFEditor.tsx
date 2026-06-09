@@ -1,24 +1,7 @@
 'use client'
 
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useCallback } from 'react'
 import styles from './PDFEditor.module.css'
-
-interface Message {
-  role: 'user' | 'assistant'
-  text: string
-  isError?: boolean
-}
-
-interface ApiMessage {
-  role: 'user' | 'assistant'
-  content: string | ApiContent[]
-}
-
-interface ApiContent {
-  type: string
-  source?: { type: string; media_type: string; data: string }
-  text?: string
-}
 
 declare global {
   interface Window {
@@ -26,7 +9,6 @@ declare global {
     _pyodide?: PyodideInterface
   }
 }
-
 interface PyodideInterface {
   loadPackage: (pkgs: string[]) => Promise<void>
   pyimport: (name: string) => { install: (pkgs: string[]) => Promise<void> }
@@ -35,270 +17,416 @@ interface PyodideInterface {
   setStderr: (opts: { batched: (s: string) => void }) => void
 }
 
-const QUICK_CMDS = [
-  { label: 'Заменить текст', cmd: 'Замени все вхождения слова ___ на ___' },
-  { label: 'Водяной знак', cmd: 'Добавь водяной знак "КОНФИДЕНЦИАЛЬНО" на все страницы' },
-  { label: 'Удалить страницы', cmd: 'Удали страницы с ___ по ___' },
-  { label: 'Номера страниц', cmd: 'Добавь номера страниц снизу по центру' },
-  { label: 'Разбить PDF', cmd: 'Извлеки страницы с ___ по ___ в отдельный файл' },
-  { label: 'Повернуть страницу', cmd: 'Поверни страницу ___ на 90 градусов' },
+type Tool = 'watermark' | 'delete_pages' | 'extract_pages' | 'page_numbers' | 'rotate'
+
+interface ToolParams {
+  watermark: { text: string; opacity: string; color: string }
+  delete_pages: { pages: string }
+  extract_pages: { pages: string }
+  page_numbers: { position: string; size: string }
+  rotate: { pages: string; angle: string }
+}
+
+const TOOLS: { id: Tool; label: string; icon: string; desc: string }[] = [
+  { id: 'watermark', icon: 'ti-droplet', label: 'Водяной знак', desc: 'Текст на всех страницах' },
+  { id: 'delete_pages', icon: 'ti-trash', label: 'Удалить страницы', desc: 'Убрать страницы из PDF' },
+  { id: 'extract_pages', icon: 'ti-scissors', label: 'Извлечь страницы', desc: 'Сохранить только нужные' },
+  { id: 'page_numbers', icon: 'ti-hash', label: 'Номера страниц', desc: 'Добавить нумерацию' },
+  { id: 'rotate', icon: 'ti-rotate', label: 'Повернуть', desc: 'Повернуть страницы' },
 ]
 
+function buildPython(tool: Tool, params: ToolParams, b64: string): string {
+  const base = `
+import base64, os
+os.makedirs('/tmp', exist_ok=True)
+with open('/tmp/input.pdf', 'wb') as f:
+    f.write(base64.b64decode("""${b64}"""))
+from pypdf import PdfReader, PdfWriter
+`
+  const scripts: Record<Tool, string> = {
+    watermark: `
+${base}
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.colors import HexColor
+import io
+
+reader = PdfReader('/tmp/input.pdf')
+writer = PdfWriter()
+
+color_map = {'gray': '#888888', 'red': '#cc0000', 'blue': '#0044cc'}
+hex_color = color_map.get('${params.watermark.color}', '#888888')
+opacity = float('${params.watermark.opacity}') / 100
+
+for page in reader.pages:
+    w = float(page.mediabox.width)
+    h = float(page.mediabox.height)
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(w, h))
+    c.setFillColor(HexColor(hex_color), alpha=opacity)
+    c.setFont('Helvetica-Bold', min(w, h) // 8)
+    c.saveState()
+    c.translate(w/2, h/2)
+    c.rotate(45)
+    text = '${params.watermark.text}'
+    c.drawCentredString(0, 0, text)
+    c.restoreState()
+    c.save()
+    buf.seek(0)
+    wm_page = PdfReader(buf).pages[0]
+    page.merge_page(wm_page)
+    writer.add_page(page)
+
+with open('/tmp/output.pdf', 'wb') as f:
+    writer.write(f)
+`,
+    delete_pages: `
+${base}
+def parse_pages(s, total):
+    result = set()
+    for part in s.split(','):
+        part = part.strip()
+        if '-' in part:
+            a, b = part.split('-')
+            result.update(range(int(a)-1, int(b)))
+        elif part:
+            result.add(int(part)-1)
+    return result
+
+reader = PdfReader('/tmp/input.pdf')
+writer = PdfWriter()
+to_delete = parse_pages('${params.delete_pages.pages}', len(reader.pages))
+for i, page in enumerate(reader.pages):
+    if i not in to_delete:
+        writer.add_page(page)
+with open('/tmp/output.pdf', 'wb') as f:
+    writer.write(f)
+`,
+    extract_pages: `
+${base}
+def parse_pages(s, total):
+    result = set()
+    for part in s.split(','):
+        part = part.strip()
+        if '-' in part:
+            a, b = part.split('-')
+            result.update(range(int(a)-1, int(b)))
+        elif part:
+            result.add(int(part)-1)
+    return result
+
+reader = PdfReader('/tmp/input.pdf')
+writer = PdfWriter()
+to_keep = parse_pages('${params.extract_pages.pages}', len(reader.pages))
+for i in sorted(to_keep):
+    if i < len(reader.pages):
+        writer.add_page(reader.pages[i])
+with open('/tmp/output.pdf', 'wb') as f:
+    writer.write(f)
+`,
+    page_numbers: `
+${base}
+from reportlab.pdfgen import canvas
+from reportlab.lib.colors import HexColor
+import io
+
+reader = PdfReader('/tmp/input.pdf')
+writer = PdfWriter()
+pos = '${params.page_numbers.position}'
+font_size = int('${params.page_numbers.size}')
+total = len(reader.pages)
+
+for i, page in enumerate(reader.pages):
+    w = float(page.mediabox.width)
+    h = float(page.mediabox.height)
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(w, h))
+    c.setFillColor(HexColor('#333333'))
+    c.setFont('Helvetica', font_size)
+    text = f'{i+1} / {total}'
+    margin = 30
+    if pos == 'bottom_center':
+        c.drawCentredString(w/2, margin, text)
+    elif pos == 'bottom_right':
+        c.drawRightString(w - margin, margin, text)
+    elif pos == 'bottom_left':
+        c.drawString(margin, margin, text)
+    elif pos == 'top_center':
+        c.drawCentredString(w/2, h - margin - font_size, text)
+    c.save()
+    buf.seek(0)
+    num_page = PdfReader(buf).pages[0]
+    page.merge_page(num_page)
+    writer.add_page(page)
+
+with open('/tmp/output.pdf', 'wb') as f:
+    writer.write(f)
+`,
+    rotate: `
+${base}
+def parse_pages(s, total):
+    if s.strip().lower() == 'all':
+        return set(range(total))
+    result = set()
+    for part in s.split(','):
+        part = part.strip()
+        if '-' in part:
+            a, b = part.split('-')
+            result.update(range(int(a)-1, int(b)))
+        elif part:
+            result.add(int(part)-1)
+    return result
+
+reader = PdfReader('/tmp/input.pdf')
+writer = PdfWriter()
+angle = int('${params.rotate.angle}')
+to_rotate = parse_pages('${params.rotate.pages}', len(reader.pages))
+for i, page in enumerate(reader.pages):
+    if i in to_rotate:
+        page.rotate(angle)
+    writer.add_page(page)
+with open('/tmp/output.pdf', 'wb') as f:
+    writer.write(f)
+`,
+  }
+  return scripts[tool] + `
+import base64 as _b64
+with open('/tmp/output.pdf','rb') as _f:
+    print("OUTPUT_B64:" + _b64.b64encode(_f.read()).decode())
+`
+}
+
 export default function PDFEditor() {
-  const [messages, setMessages] = useState<Message[]>([
-    { role: 'assistant', text: 'Привет! Загрузи PDF-файл, затем напиши что нужно сделать — заменить текст, добавить водяной знак, удалить страницы, и т.д.' },
-  ])
-  const [input, setInput] = useState('')
   const [pdfBase64, setPdfBase64] = useState<string | null>(null)
   const [pdfFilename, setPdfFilename] = useState('')
-  const [loading, setLoading] = useState(false)
+  const [pdfPageCount, setPdfPageCount] = useState<number | null>(null)
+  const [activeTool, setActiveTool] = useState<Tool | null>(null)
+  const [params, setParams] = useState<ToolParams>({
+    watermark: { text: 'КОНФИДЕНЦИАЛЬНО', opacity: '25', color: 'gray' },
+    delete_pages: { pages: '' },
+    extract_pages: { pages: '' },
+    page_numbers: { position: 'bottom_center', size: '10' },
+    rotate: { pages: 'all', angle: '90' },
+  })
+  const [status, setStatus] = useState<{ type: 'idle' | 'loading' | 'success' | 'error'; msg: string }>({ type: 'idle', msg: '' })
   const [resultBlob, setResultBlob] = useState<Blob | null>(null)
-  const [resultFilename, setResultFilename] = useState('')
-  const [pyodideReady, setPyodideReady] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
-  const messagesEndRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const historyRef = useRef<ApiMessage[]>([])
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
-
-  const addMsg = (msg: Message) => setMessages(prev => [...prev, msg])
 
   const loadFile = useCallback((file: File) => {
     if (file.type !== 'application/pdf') return
     setPdfFilename(file.name)
     setResultBlob(null)
+    setStatus({ type: 'idle', msg: '' })
     const reader = new FileReader()
     reader.onload = () => {
       const b64 = (reader.result as string).split(',')[1]
       setPdfBase64(b64)
-      addMsg({ role: 'assistant', text: `Файл «${file.name}» загружен (${(file.size / 1024).toFixed(0)} KB). Что нужно изменить?` })
     }
     reader.readAsDataURL(file)
   }, [])
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault()
-    setIsDragging(false)
-    const file = e.dataTransfer.files[0]
-    if (file) loadFile(file)
-  }, [loadFile])
-
-  const loadPyodideEnv = async (): Promise<PyodideInterface> => {
-    if (window._pyodide) return window._pyodide
-    addMsg({ role: 'assistant', text: 'Загружаю Python-среду в браузере (~10 сек, только первый раз)...' })
-    await new Promise<void>((resolve) => {
-      const s = document.createElement('script')
-      s.src = 'https://cdn.jsdelivr.net/pyodide/v0.27.0/full/pyodide.js'
-      s.onload = () => resolve()
-      document.head.appendChild(s)
-    })
-    const py = await window.loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.27.0/full/' })
-    await py.loadPackage(['micropip'])
-    const micropip = py.pyimport('micropip')
-    await micropip.install(['pypdf', 'reportlab'])
-    window._pyodide = py
-    setPyodideReady(true)
-    return py
+  const setParam = (tool: Tool, key: string, value: string) => {
+    setParams(prev => ({ ...prev, [tool]: { ...prev[tool], [key]: value } }))
   }
 
-  const executePython = async (code: string, outFilename: string, b64: string) => {
-    const py = await loadPyodideEnv()
-    const initCode = `
-import sys, os, base64
-os.makedirs('/tmp', exist_ok=True)
-_pdf_b64 = """${b64}"""
-with open('/tmp/input.pdf', 'wb') as _f:
-    _f.write(base64.b64decode(_pdf_b64))
-`
-    const checkCode = `
-import base64 as _b64, os as _os
-if _os.path.exists('/tmp/output.pdf'):
-    with open('/tmp/output.pdf','rb') as _rf:
-        print("OUTPUT_B64:" + _b64.b64encode(_rf.read()).decode())
-else:
-    print("ERROR:output.pdf not created")
-`
-    let stdout = ''
-    py.setStdout({ batched: (s: string) => { stdout += s + '\n' } })
-    py.setStderr({ batched: (s: string) => { stdout += 'ERR:' + s + '\n' } })
-    await py.runPythonAsync(initCode + '\n' + code + '\n' + checkCode)
-
-    const marker = stdout.indexOf('OUTPUT_B64:')
-    if (marker === -1) {
-      addMsg({ role: 'assistant', text: `Ошибка выполнения: ${stdout.slice(0, 300)}`, isError: true })
-      return
-    }
-    const resultB64 = stdout.slice(marker + 11).split('\n')[0].trim()
-    const bytes = atob(resultB64)
-    const arr = new Uint8Array(bytes.length)
-    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i)
-    const blob = new Blob([arr], { type: 'application/pdf' })
-    setResultBlob(blob)
-    setResultFilename(outFilename)
-    addMsg({ role: 'assistant', text: `Готово! PDF обработан. Нажми кнопку «Скачать» ниже.` })
-  }
-
-  const sendMessage = async () => {
-    const text = input.trim()
-    if (!text || loading) return
-    setInput('')
-    setLoading(true)
+  const runTool = async () => {
+    if (!pdfBase64 || !activeTool) return
+    setStatus({ type: 'loading', msg: 'Обработка...' })
     setResultBlob(null)
-    addMsg({ role: 'user', text })
-
-    const userContent: ApiContent[] = []
-    if (pdfBase64) {
-      userContent.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 } })
-    }
-    userContent.push({ type: 'text', text })
-    historyRef.current.push({ role: 'user', content: userContent })
 
     try {
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: historyRef.current }),
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'API error')
-
-      const raw = data.content?.filter((c: ApiContent) => c.type === 'text').map((c: ApiContent) => c.text).join('') || ''
-      historyRef.current.push({ role: 'assistant', content: raw })
-
-      let parsed: { message: string; code: string | null; filename?: string }
-      try {
-        const cleaned = raw.replace(/```json|```/g, '').trim()
-        parsed = JSON.parse(cleaned)
-      } catch {
-        parsed = { message: raw, code: null }
+      if (!window._pyodide) {
+        setStatus({ type: 'loading', msg: 'Загружаю Python (~10 сек)...' })
+        await new Promise<void>(resolve => {
+          const s = document.createElement('script')
+          s.src = 'https://cdn.jsdelivr.net/pyodide/v0.27.0/full/pyodide.js'
+          s.onload = () => resolve()
+          document.head.appendChild(s)
+        })
+        const py = await window.loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.27.0/full/' })
+        await py.loadPackage(['micropip'])
+        const micropip = py.pyimport('micropip')
+        await micropip.install(['pypdf', 'reportlab'])
+        window._pyodide = py
       }
 
-      addMsg({ role: 'assistant', text: parsed.message || 'Готово.' })
+      const py = window._pyodide
+      let stdout = ''
+      py.setStdout({ batched: (s: string) => { stdout += s + '\n' } })
+      py.setStderr({ batched: (s: string) => { stdout += s + '\n' } })
 
-      if (parsed.code && pdfBase64) {
-        await executePython(parsed.code, parsed.filename || 'edited.pdf', pdfBase64)
-      }
+      const code = buildPython(activeTool, params, pdfBase64)
+      await py.runPythonAsync(code)
+
+      const marker = stdout.indexOf('OUTPUT_B64:')
+      if (marker === -1) throw new Error(stdout.slice(0, 200))
+
+      const b64 = stdout.slice(marker + 11).split('\n')[0].trim()
+      const bytes = atob(b64)
+      const arr = new Uint8Array(bytes.length)
+      for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i)
+      const blob = new Blob([arr], { type: 'application/pdf' })
+      setResultBlob(blob)
+      setStatus({ type: 'success', msg: 'Готово! Файл обработан.' })
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Неизвестная ошибка'
-      addMsg({ role: 'assistant', text: `Ошибка: ${msg}`, isError: true })
-    } finally {
-      setLoading(false)
+      setStatus({ type: 'error', msg: e instanceof Error ? e.message : 'Ошибка' })
     }
   }
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
-  }
-
-  const downloadResult = () => {
+  const download = () => {
     if (!resultBlob) return
     const url = URL.createObjectURL(resultBlob)
     const a = document.createElement('a')
-    a.href = url; a.download = resultFilename; a.click()
+    const toolLabel = TOOLS.find(t => t.id === activeTool)?.label.toLowerCase().replace(/ /g, '_') || 'edited'
+    a.href = url
+    a.download = pdfFilename.replace('.pdf', `_${toolLabel}.pdf`)
+    a.click()
     URL.revokeObjectURL(url)
   }
 
   return (
     <div className={styles.page}>
       <div className={styles.container}>
+
         <header className={styles.header}>
-          <div className={styles.headerIcon}><i className="ti ti-file-text" aria-hidden="true" /></div>
+          <div className={styles.headerIcon}><i className="ti ti-file-text" /></div>
           <div>
             <h1 className={styles.title}>PDF Editor</h1>
-            <p className={styles.subtitle}>Загрузите PDF и опишите изменения на русском</p>
+            <p className={styles.subtitle}>Редактирование PDF прямо в браузере — без серверов</p>
           </div>
         </header>
 
-        {/* Upload zone */}
+        {/* Upload */}
         <div
           className={`${styles.uploadZone} ${pdfBase64 ? styles.hasFile : ''} ${isDragging ? styles.dragging : ''}`}
           onClick={() => fileInputRef.current?.click()}
-          onDragOver={(e) => { e.preventDefault(); setIsDragging(true) }}
+          onDragOver={e => { e.preventDefault(); setIsDragging(true) }}
           onDragLeave={() => setIsDragging(false)}
-          onDrop={handleDrop}
-          role="button"
-          tabIndex={0}
-          aria-label="Загрузить PDF файл"
-          onKeyDown={(e) => e.key === 'Enter' && fileInputRef.current?.click()}
+          onDrop={e => { e.preventDefault(); setIsDragging(false); if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]) }}
+          role="button" tabIndex={0}
+          onKeyDown={e => e.key === 'Enter' && fileInputRef.current?.click()}
         >
-          <i className={`ti ${pdfBase64 ? 'ti-circle-check' : 'ti-upload'}`} aria-hidden="true" style={{ fontSize: 28, display: 'block', marginBottom: 6 }} />
-          <span className={styles.uploadLabel}>
-            {pdfBase64 ? pdfFilename : 'Нажмите или перетащите PDF-файл'}
-          </span>
+          <i className={`ti ${pdfBase64 ? 'ti-circle-check' : 'ti-upload'}`} style={{ fontSize: 30, display: 'block', marginBottom: 8 }} />
+          <span className={styles.uploadLabel}>{pdfBase64 ? pdfFilename : 'Нажмите или перетащите PDF-файл'}</span>
           {pdfBase64 && <span className={styles.uploadSub}>Нажмите чтобы заменить</span>}
         </div>
-        <input ref={fileInputRef} type="file" accept=".pdf" style={{ display: 'none' }} onChange={(e) => { if (e.target.files?.[0]) loadFile(e.target.files[0]) }} />
+        <input ref={fileInputRef} type="file" accept=".pdf" style={{ display: 'none' }} onChange={e => { if (e.target.files?.[0]) loadFile(e.target.files[0]) }} />
 
-        {/* Quick commands */}
-        <div className={styles.sectionLabel}>Быстрые команды</div>
-        <div className={styles.chips}>
-          {QUICK_CMDS.map((c) => (
-            <button key={c.label} className={styles.chip} onClick={() => setInput(c.cmd)}>{c.label}</button>
-          ))}
-        </div>
+        {/* Tools */}
+        {pdfBase64 && (
+          <>
+            <div className={styles.sectionLabel}>Выберите операцию</div>
+            <div className={styles.toolGrid}>
+              {TOOLS.map(t => (
+                <button
+                  key={t.id}
+                  className={`${styles.toolCard} ${activeTool === t.id ? styles.toolCardActive : ''}`}
+                  onClick={() => { setActiveTool(t.id); setResultBlob(null); setStatus({ type: 'idle', msg: '' }) }}
+                >
+                  <i className={`ti ${t.icon}`} style={{ fontSize: 22, marginBottom: 6, display: 'block' }} />
+                  <span className={styles.toolLabel}>{t.label}</span>
+                  <span className={styles.toolDesc}>{t.desc}</span>
+                </button>
+              ))}
+            </div>
+          </>
+        )}
 
-        {/* Chat */}
-        <div className={styles.chatBox}>
-          <div className={styles.messages}>
-            {messages.map((m, i) => (
-              <div key={i} className={`${styles.msgRow} ${m.role === 'user' ? styles.userRow : ''}`}>
-                <div className={`${styles.avatar} ${m.role === 'user' ? styles.userAvatar : styles.aiAvatar}`}>
-                  {m.role === 'user' ? <i className="ti ti-user" aria-hidden="true" style={{ fontSize: 13 }} /> : 'AI'}
-                </div>
-                <div className={`${styles.bubble} ${m.role === 'user' ? styles.userBubble : styles.aiBubble} ${m.isError ? styles.errorBubble : ''}`}>
-                  {m.text}
-                </div>
-              </div>
-            ))}
-            {loading && (
-              <div className={styles.msgRow}>
-                <div className={`${styles.avatar} ${styles.aiAvatar}`}>AI</div>
-                <div className={`${styles.bubble} ${styles.aiBubble}`}>
-                  <span className={styles.dots}><span /><span /><span /></span>
+        {/* Params */}
+        {activeTool && pdfBase64 && (
+          <div className={styles.paramsBox}>
+            {activeTool === 'watermark' && (
+              <div className={styles.paramGroup}>
+                <label className={styles.paramLabel}>Текст водяного знака</label>
+                <input className={styles.paramInput} value={params.watermark.text} onChange={e => setParam('watermark', 'text', e.target.value)} placeholder="КОНФИДЕНЦИАЛЬНО" />
+                <label className={styles.paramLabel}>Прозрачность: {params.watermark.opacity}%</label>
+                <input type="range" min="5" max="80" value={params.watermark.opacity} onChange={e => setParam('watermark', 'opacity', e.target.value)} className={styles.paramRange} />
+                <label className={styles.paramLabel}>Цвет</label>
+                <div className={styles.radioGroup}>
+                  {[['gray','Серый'],['red','Красный'],['blue','Синий']].map(([v,l]) => (
+                    <label key={v} className={styles.radioLabel}>
+                      <input type="radio" name="wmcolor" value={v} checked={params.watermark.color === v} onChange={() => setParam('watermark', 'color', v)} /> {l}
+                    </label>
+                  ))}
                 </div>
               </div>
             )}
-            <div ref={messagesEndRef} />
-          </div>
-          <div className={styles.inputRow}>
-            <textarea
-              className={styles.textarea}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Опишите изменения..."
-              rows={1}
-              disabled={loading}
-            />
-            <button
-              className={styles.sendBtn}
-              onClick={sendMessage}
-              disabled={!input.trim() || loading}
-              aria-label="Отправить"
-            >
-              <i className="ti ti-arrow-up" aria-hidden="true" style={{ fontSize: 16 }} />
-            </button>
-          </div>
-        </div>
+            {activeTool === 'delete_pages' && (
+              <div className={styles.paramGroup}>
+                <label className={styles.paramLabel}>Страницы для удаления</label>
+                <input className={styles.paramInput} value={params.delete_pages.pages} onChange={e => setParam('delete_pages', 'pages', e.target.value)} placeholder="Например: 1, 3, 5-7" />
+                <p className={styles.paramHint}>Формат: 1, 3, 5-7 (страницы нумеруются с 1)</p>
+              </div>
+            )}
+            {activeTool === 'extract_pages' && (
+              <div className={styles.paramGroup}>
+                <label className={styles.paramLabel}>Страницы для извлечения</label>
+                <input className={styles.paramInput} value={params.extract_pages.pages} onChange={e => setParam('extract_pages', 'pages', e.target.value)} placeholder="Например: 1-3, 5" />
+                <p className={styles.paramHint}>Формат: 1-3, 5 (страницы нумеруются с 1)</p>
+              </div>
+            )}
+            {activeTool === 'page_numbers' && (
+              <div className={styles.paramGroup}>
+                <label className={styles.paramLabel}>Расположение</label>
+                <div className={styles.radioGroup}>
+                  {[['bottom_center','Снизу по центру'],['bottom_right','Снизу справа'],['bottom_left','Снизу слева'],['top_center','Сверху по центру']].map(([v,l]) => (
+                    <label key={v} className={styles.radioLabel}>
+                      <input type="radio" name="numpos" value={v} checked={params.page_numbers.position === v} onChange={() => setParam('page_numbers', 'position', v)} /> {l}
+                    </label>
+                  ))}
+                </div>
+                <label className={styles.paramLabel}>Размер шрифта: {params.page_numbers.size}px</label>
+                <input type="range" min="8" max="18" value={params.page_numbers.size} onChange={e => setParam('page_numbers', 'size', e.target.value)} className={styles.paramRange} />
+              </div>
+            )}
+            {activeTool === 'rotate' && (
+              <div className={styles.paramGroup}>
+                <label className={styles.paramLabel}>Страницы для поворота</label>
+                <input className={styles.paramInput} value={params.rotate.pages} onChange={e => setParam('rotate', 'pages', e.target.value)} placeholder="all или 1, 2-4" />
+                <p className={styles.paramHint}>Введите all для всех страниц или номера: 1, 3-5</p>
+                <label className={styles.paramLabel}>Угол поворота</label>
+                <div className={styles.radioGroup}>
+                  {[['90','90° →'],['180','180°'],['270','270° ←']].map(([v,l]) => (
+                    <label key={v} className={styles.radioLabel}>
+                      <input type="radio" name="angle" value={v} checked={params.rotate.angle === v} onChange={() => setParam('rotate', 'angle', v)} /> {l}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
 
-        {/* Download bar */}
-        {resultBlob && (
-          <div className={styles.downloadBar}>
-            <i className="ti ti-circle-check" aria-hidden="true" style={{ fontSize: 20, color: '#3B6D11' }} />
-            <span>{resultFilename} — обработка завершена</span>
-            <button className={styles.downloadBtn} onClick={downloadResult}>
-              <i className="ti ti-download" aria-hidden="true" style={{ fontSize: 14 }} />
-              Скачать
+            <button
+              className={styles.runBtn}
+              onClick={runTool}
+              disabled={status.type === 'loading'}
+            >
+              {status.type === 'loading'
+                ? <><span className={styles.spinner} /> {status.msg}</>
+                : <><i className="ti ti-player-play" /> Выполнить</>
+              }
             </button>
           </div>
         )}
 
-        <p className={styles.note}>
-          {pyodideReady ? '✓ Python-среда готова' : 'Python загружается в браузере при первом запросе'} · Файлы не покидают ваш браузер
-        </p>
+        {/* Status */}
+        {status.type === 'success' && resultBlob && (
+          <div className={styles.downloadBar}>
+            <i className="ti ti-circle-check" style={{ fontSize: 20, color: '#3B6D11' }} />
+            <span>{status.msg}</span>
+            <button className={styles.downloadBtn} onClick={download}>
+              <i className="ti ti-download" /> Скачать PDF
+            </button>
+          </div>
+        )}
+        {status.type === 'error' && (
+          <div className={styles.errorBar}>
+            <i className="ti ti-alert-circle" style={{ fontSize: 18 }} />
+            <span>{status.msg}</span>
+          </div>
+        )}
+
+        <p className={styles.note}>Файлы обрабатываются локально в браузере · Ничего не отправляется на сервер</p>
       </div>
     </div>
   )
