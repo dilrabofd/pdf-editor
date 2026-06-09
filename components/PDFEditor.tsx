@@ -48,12 +48,13 @@ from pypdf import PdfReader, PdfWriter
   const scripts: Record<Tool, string> = {
     replace_text: `
 \${base}
+import base64 as _b64e
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import HexColor
 import io
 
-find_text = '''${params.replace_text.find}'''
-replace_text_val = '''${params.replace_text.replace}'''
+find_text = _b64e.b64decode("\${btoa(unescape(encodeURIComponent(params.replace_text.find)))}").decode('utf-8')
+replace_text_val = _b64e.b64decode("\${btoa(unescape(encodeURIComponent(params.replace_text.replace)))}").decode('utf-8')
 
 reader = PdfReader('/tmp/input.pdf')
 writer = PdfWriter()
@@ -61,12 +62,12 @@ replaced_count = 0
 
 for page in reader.pages:
     page_text = page.extract_text() or ''
-    if find_text in page_text:
+    if find_text and find_text in page_text:
         w = float(page.mediabox.width)
         h = float(page.mediabox.height)
         buf = io.BytesIO()
         c = canvas.Canvas(buf, pagesize=(w, h))
-        lines = page_text.split('\n')
+        lines = page_text.split('\\n')
         y = h - 40
         for line in lines:
             new_line = line.replace(find_text, replace_text_val)
