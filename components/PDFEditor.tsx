@@ -17,9 +17,10 @@ interface PyodideInterface {
   setStderr: (opts: { batched: (s: string) => void }) => void
 }
 
-type Tool = 'watermark' | 'delete_pages' | 'extract_pages' | 'page_numbers' | 'rotate'
+type Tool = 'replace_text' | 'watermark' | 'delete_pages' | 'extract_pages' | 'page_numbers' | 'rotate'
 
 interface ToolParams {
+  replace_text: { find: string; replace: string }
   watermark: { text: string; opacity: string; color: string }
   delete_pages: { pages: string }
   extract_pages: { pages: string }
@@ -28,6 +29,7 @@ interface ToolParams {
 }
 
 const TOOLS: { id: Tool; label: string; icon: string; desc: string }[] = [
+  { id: 'replace_text', icon: 'ti-replace', label: 'Заменить текст', desc: 'Найти и заменить' },
   { id: 'watermark', icon: 'ti-droplet', label: 'Водяной знак', desc: 'Текст на всех страницах' },
   { id: 'delete_pages', icon: 'ti-trash', label: 'Удалить страницы', desc: 'Убрать страницы из PDF' },
   { id: 'extract_pages', icon: 'ti-scissors', label: 'Извлечь страницы', desc: 'Сохранить только нужные' },
@@ -44,6 +46,50 @@ with open('/tmp/input.pdf', 'wb') as f:
 from pypdf import PdfReader, PdfWriter
 `
   const scripts: Record<Tool, string> = {
+    replace_text: `
+\${base}
+from reportlab.pdfgen import canvas
+from reportlab.lib.colors import HexColor
+import io
+
+find_text = '''${params.replace_text.find}'''
+replace_text_val = '''${params.replace_text.replace}'''
+
+reader = PdfReader('/tmp/input.pdf')
+writer = PdfWriter()
+replaced_count = 0
+
+for page in reader.pages:
+    page_text = page.extract_text() or ''
+    if find_text in page_text:
+        w = float(page.mediabox.width)
+        h = float(page.mediabox.height)
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=(w, h))
+        lines = page_text.split('\n')
+        y = h - 40
+        for line in lines:
+            new_line = line.replace(find_text, replace_text_val)
+            if new_line != line:
+                replaced_count += 1
+            c.setFont('Helvetica', 10)
+            c.setFillColor(HexColor('#FFFFFF'))
+            c.rect(0, y - 2, w, 14, fill=1, stroke=0)
+            c.setFillColor(HexColor('#000000'))
+            c.drawString(40, y, new_line[:120])
+            y -= 14
+            if y < 40:
+                break
+        c.save()
+        buf.seek(0)
+        overlay = PdfReader(buf).pages[0]
+        page.merge_page(overlay)
+    writer.add_page(page)
+
+with open('/tmp/output.pdf', 'wb') as f:
+    writer.write(f)
+print(f"Replaced in {replaced_count} lines")
+`,
     watermark: `
 ${base}
 from reportlab.pdfgen import canvas
@@ -202,6 +248,7 @@ export default function PDFEditor() {
   const [pdfPageCount, setPdfPageCount] = useState<number | null>(null)
   const [activeTool, setActiveTool] = useState<Tool | null>(null)
   const [params, setParams] = useState<ToolParams>({
+    replace_text: { find: '', replace: '' },
     watermark: { text: 'КОНФИДЕНЦИАЛЬНО', opacity: '25', color: 'gray' },
     delete_pages: { pages: '' },
     extract_pages: { pages: '' },
@@ -336,6 +383,15 @@ export default function PDFEditor() {
         {/* Params */}
         {activeTool && pdfBase64 && (
           <div className={styles.paramsBox}>
+            {activeTool === 'replace_text' && (
+              <div className={styles.paramGroup}>
+                <label className={styles.paramLabel}>Найти текст</label>
+                <input className={styles.paramInput} value={params.replace_text.find} onChange={e => setParam('replace_text', 'find', e.target.value)} placeholder="Текст для поиска..." />
+                <label className={styles.paramLabel}>Заменить на</label>
+                <input className={styles.paramInput} value={params.replace_text.replace} onChange={e => setParam('replace_text', 'replace', e.target.value)} placeholder="Новый текст..." />
+                <p className={styles.paramHint}>Работает только для текстовых PDF (не сканов). Регистр учитывается.</p>
+              </div>
+            )}
             {activeTool === 'watermark' && (
               <div className={styles.paramGroup}>
                 <label className={styles.paramLabel}>Текст водяного знака</label>
